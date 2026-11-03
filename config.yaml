@@ -1,12 +1,11 @@
 model:
-  name: hosted_vllm/LiquidAI/LFM2.5-350M
+  name: anthropic/claude-haiku-5-5
   args:
-    api_base: http://127.0.0.1:8000/v1
-    temperature: 0.1
-    top_p: 1.0
-    top_k: 50
-    repetition_penalty: 1.05
-    max_tokens: 1024
+    temperature: null
+    top_p: null
+    reasoning_effort: low
+    cache_control: { type: ephemeral }
+    max_tokens: 16000
 
 data:
   dir: data
@@ -26,7 +25,7 @@ run:
 
 chain:
   - {
-      name: test,
-      data: { split: test },
-      run: { trials: 4, out: runs/lfm350m-test.json },
+      name: train,
+      data: { split: train },
+      run: { trials: 1, out: runs/haiku55-train.json },
     }

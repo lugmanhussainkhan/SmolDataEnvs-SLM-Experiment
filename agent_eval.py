@@ -7,7 +7,7 @@
 
 uv run agent_eval.py --config config.yaml
 uv run agent_eval.py --config config.yaml --set run.trials=4 --steps test --resume
-uv run agent_eval.py --config config.yaml --resume --train-mode   # also retry zero-reward episodes
+uv run agent_eval.py --config config.yaml --resume --train-mode
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import hashlib
 import json
 import math
 import shutil
@@ -145,6 +146,10 @@ def grade(row: dict, answer: str | None) -> dict:
 # ── episode ──────────────────────────────────────────────────────────────────
 
 
+def _digest(messages: list[dict]) -> str:
+    return hashlib.sha256(json.dumps(messages, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
 def run_tool(ep, name: str, arguments: str, agent: dict) -> tuple[str, dict]:
     try:
         args = json.loads(arguments) if arguments.strip() else {}
@@ -205,8 +210,8 @@ async def run_episode(
         return rec
 
     args = dict(m["args"])
-    if args.get("temperature", 0) > 0:
-        args.setdefault("seed", cfg["run"]["seed"] * 1000 + trial + 1_000_000 * attempt)  # retries resample
+    if (args.get("temperature") or 0) > 0:
+        args.setdefault("seed", cfg["run"]["seed"] * 1000 + trial + 1_000_000 * attempt)
     messages = [
         {"role": "system", "content": agent["system_prompt"] or SYSTEM_PROMPT},
         {"role": "user", "content": row["instruction"]},
@@ -217,6 +222,7 @@ async def run_episode(
     try:
         for turn in range(agent["max_turns"]):
             t_call = time.time()
+            sent = (len(messages), _digest(messages))
             try:
                 resp = await litellm.acompletion(
                     model=m["name"],
@@ -234,10 +240,7 @@ async def run_episode(
                 raise
             choice, usage = resp.choices[0], resp.usage
             msg = choice.message
-            # replay the response message as-is so reasoning (thinking_blocks / reasoning_content) stays in context
             assistant = msg.model_dump(exclude_none=True)
-            # empty content: "" keeps chat templates happy, but next to thinking blocks LiteLLM would inject a
-            # placeholder text block for "", so leave it None there
             assistant["content"] = msg.content or (None if assistant.get("thinking_blocks") else "")
             calls = assistant.get("tool_calls") or []
             for tc in calls:
@@ -250,6 +253,9 @@ async def run_episode(
                 "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
                 "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
                 "latency": round(time.time() - t_call, 3),
+                "context_messages": sent[0],
+                "context_digest": sent[1],
+                "usage": usage.model_dump(mode="json", exclude_none=True) if usage else None,
                 "executions": [],
             }
             if reasoning := getattr(msg, "reasoning_content", None):
@@ -280,6 +286,9 @@ async def run_episode(
         await loop.run_in_executor(pool, ep.close)
     rec["seconds"] = round(time.time() - t0, 2)
     rec["messages"] = messages
+    rec["context_append_only"] = all(
+        _digest(messages[: t["context_messages"]]) == t["context_digest"] for t in rec["turns"]
+    )
     return rec
 
 
@@ -328,6 +337,7 @@ def summarize(cfg: dict, results: list[dict], wall: float, resumed: int) -> dict
         "stop_reasons": dict(Counter(r["stop"] for r in graded)),
         "grade_methods": dict(Counter(r["grade_method"] for r in graded)),
         "answered": sum(r["grade_method"] != "no_answer_file" for r in graded),
+        "context_edited": sum(not r.get("context_append_only", True) for r in results),
         "errors": dict(Counter(r["error"].split(":")[0] for r in results if r["error"])),
         "mean_turns": mean("n_turns"),
         "mean_tool_calls": mean("n_tool_calls"),
@@ -342,7 +352,6 @@ def summarize(cfg: dict, results: list[dict], wall: float, resumed: int) -> dict
 
 
 def _finished(rec: dict, train_mode: bool) -> bool:
-    """Eval keeps every graded episode; train mode also retries zero-reward ones."""
     return rec["error"] is None and (not train_mode or (rec["reward"] or 0) > 0)
 
 
@@ -364,7 +373,7 @@ def run_one(cfg: dict, resume: bool = False, train_mode: bool = False) -> dict:
             for r in previous
             if _finished(r, train_mode) and (r["task_id"], r["trial"]) in wanted
         }
-        for r in previous:  # next attempt number per retried episode, so sampled retries get a fresh seed
+        for r in previous:
             key = (r["task_id"], r["trial"])
             attempts[key] = max(attempts.get(key, 0), r.get("attempt", 0) + 1)
     elif partial.is_file():
