@@ -7,6 +7,7 @@
 
 uv run agent_eval.py --config config.yaml
 uv run agent_eval.py --config config.yaml --set run.trials=4 --steps test --resume
+uv run agent_eval.py --config config.yaml --resume --train-mode   # also retry zero-reward episodes
 """
 
 from __future__ import annotations
@@ -171,7 +172,9 @@ def _is_context_error(exc: Exception) -> bool:
     )
 
 
-async def run_episode(cfg: dict, row: dict, trial: int, sb: Sandbox, pool: ThreadPoolExecutor) -> dict:
+async def run_episode(
+    cfg: dict, row: dict, trial: int, sb: Sandbox, pool: ThreadPoolExecutor, attempt: int = 0
+) -> dict:
     import litellm
 
     loop = asyncio.get_running_loop()
@@ -179,6 +182,7 @@ async def run_episode(cfg: dict, row: dict, trial: int, sb: Sandbox, pool: Threa
     rec = {
         "task_id": row["task_id"],
         "trial": trial,
+        "attempt": attempt,
         "tier": row["difficulty_tier"],
         "reward_mode": row["reward_mode"],
         "gold": row["answer"],
@@ -202,7 +206,7 @@ async def run_episode(cfg: dict, row: dict, trial: int, sb: Sandbox, pool: Threa
 
     args = dict(m["args"])
     if args.get("temperature", 0) > 0:
-        args.setdefault("seed", cfg["run"]["seed"] * 1000 + trial)
+        args.setdefault("seed", cfg["run"]["seed"] * 1000 + trial + 1_000_000 * attempt)  # retries resample
     messages = [
         {"role": "system", "content": agent["system_prompt"] or SYSTEM_PROMPT},
         {"role": "user", "content": row["instruction"]},
@@ -338,15 +342,20 @@ def summarize(cfg: dict, results: list[dict], wall: float, resumed: int) -> dict
 # ── run ──────────────────────────────────────────────────────────────────────
 
 
-def run_one(cfg: dict, resume: bool = False) -> dict:
+def _finished(rec: dict, train_mode: bool) -> bool:
+    """Eval keeps every graded episode; train mode also retries zero-reward ones."""
+    return rec["error"] is None and (not train_mode or (rec["reward"] or 0) > 0)
+
+
+def run_one(cfg: dict, resume: bool = False, train_mode: bool = False) -> dict:
     rows = load_tasks(cfg["data"])
     out = Path(cfg["run"]["out"])
     out.parent.mkdir(parents=True, exist_ok=True)
     partial = out.with_suffix(out.suffix + ".partial.jsonl")
     trials = cfg["run"]["trials"]
     wanted = {(r["task_id"], t) for r in rows for t in range(trials)}
-    done, previous = {}, []
-    if resume:  # keep finished episodes from the output and the partial log; rerun errored ones
+    done, previous, attempts = {}, [], {}
+    if resume:  # keep finished episodes from the output and the partial log; rerun the rest
         if out.is_file():
             previous = json.loads(out.read_text())["results"]
         if partial.is_file():
@@ -354,14 +363,17 @@ def run_one(cfg: dict, resume: bool = False) -> dict:
         done = {
             (r["task_id"], r["trial"]): r
             for r in previous
-            if r["error"] is None and (r["task_id"], r["trial"]) in wanted
+            if _finished(r, train_mode) and (r["task_id"], r["trial"]) in wanted
         }
+        for r in previous:  # next attempt number per retried episode, so sampled retries get a fresh seed
+            key = (r["task_id"], r["trial"])
+            attempts[key] = max(attempts.get(key, 0), r.get("attempt", 0) + 1)
     elif partial.is_file():
         partial.unlink()
     todo = [(r, t) for r in rows for t in range(trials) if (r["task_id"], t) not in done]
     print(
         f"{cfg['model']['name']} on {cfg['data']['split']}: {len(rows)} tasks x {trials} trials "
-        f"({len(done)} resumed), concurrency {cfg['run']['concurrency']}"
+        f"({len(done)} resumed{', train mode' if train_mode else ''}), concurrency {cfg['run']['concurrency']}"
     )
 
     scratch = Path(tempfile.mkdtemp(prefix="smol-agent-"))
@@ -379,7 +391,7 @@ def run_one(cfg: dict, resume: bool = False) -> dict:
         async def one(row: dict, trial: int) -> dict:
             nonlocal n
             async with sem:
-                rec = await run_episode(cfg, row, trial, sb, pool)
+                rec = await run_episode(cfg, row, trial, sb, pool, attempts.get((row["task_id"], trial), 0))
             n += 1
             with partial.open("a") as fh:
                 fh.write(json.dumps(rec) + "\n")
@@ -421,6 +433,11 @@ def main() -> None:
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--steps", help="comma list of chain step names to run")
     ap.add_argument("--resume", action="store_true", help="skip finished steps, continue partial ones")
+    ap.add_argument(
+        "--train-mode",
+        action="store_true",
+        help="trajectory generation: with --resume, also retry episodes that graded zero (not just errored ones)",
+    )
     a = ap.parse_args()
     try:
         from dotenv import load_dotenv
@@ -445,13 +462,15 @@ def main() -> None:
         print(f"\n=== [{i}/{len(runs)}] {cfg['name']}: split={cfg['data']['split']} -> {out}")
         resume = a.resume or cfg["run"]["skip_existing"]
         if resume and out.is_file():
-            summary = json.loads(out.read_text()).get("summary") or {}
-            if not summary.get("ungraded"):
+            prev = json.loads(out.read_text())
+            summary = prev.get("summary") or {}
+            retry = sum(not _finished(r, a.train_mode) for r in prev.get("results", []))
+            if not retry:
                 print("    output exists, skipping")
                 summaries.append((cfg["name"], summary))
                 continue
-            print(f"    output has {summary['ungraded']} ungraded episodes, rerunning those")
-        summaries.append((cfg["name"], run_one(cfg, resume)))
+            print(f"    output has {retry} {'failed' if a.train_mode else 'ungraded'} episodes, rerunning those")
+        summaries.append((cfg["name"], run_one(cfg, resume, a.train_mode)))
 
     if len(summaries) > 1:
         print("\n=== chain summary")
