@@ -2,7 +2,7 @@
 
 Rules: the answer must be one value on one line (<= 200 chars). Numeric golds need a single number
 that rounds to the gold's precision (capped at 4 dp); x100 / /100 only when the question is about
-a percent or a rate. Text golds need a case-insensitive exact match. Lists match item by item in
+a percent or a rate. Text golds need an exact match ignoring case, spaces, '_' and '-'. Lists match item by item in
 any order. yes/true/y and no/false/n are equivalent.
 
     python grader.py runs/a.json runs/b.json [--csv rescored.csv]   # re-grade saved eval runs
@@ -70,8 +70,20 @@ def _numeric_method(cand: str, gold: str, question: str) -> str | None:
     return None
 
 
+def _squash(s: str) -> str:
+    return re.sub(r"(?<=\w)[\s_\-]+(?=\w)", "", s)
+
+
+def _same_label(cand: str, gold: str) -> bool:
+    """Case-insensitive; text labels also ignore spaces, '_' and '-' ('UTTARPRADESH' == 'Uttar Pradesh')."""
+    c, g = _clean(cand).lower(), _clean(gold).lower()
+    if c == g:
+        return True
+    return parse_number(gold)[0] is None and _squash(c) == _squash(g) != ""
+
+
 def _item_match(cand: str, gold: str, question: str) -> bool:
-    if _clean(cand).lower() == _clean(gold).lower():
+    if _same_label(cand, gold):
         return True
     return parse_number(gold)[0] is not None and _numeric_method(cand, gold, question) is not None
 
@@ -90,7 +102,7 @@ def grade(gold, candidate, *, reward_mode: str = "", question: str = "") -> Grad
     if "\n" in cand or len(cand) > MAX_LEN:
         return GradeResult(0.0, "invalid_format")
     c, g = _clean(cand).lower(), _clean(gold).lower()
-    if c == g:
+    if _same_label(cand, gold):
         return GradeResult(1.0, "exact")
     if reward_mode == "exact_bool" or g in _BOOL:
         ok = _BOOL.get(c, "?c") == _BOOL.get(g, "?g")

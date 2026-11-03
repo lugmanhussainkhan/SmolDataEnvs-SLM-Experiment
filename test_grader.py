@@ -65,6 +65,13 @@ CASES = [  # gold, answer, reward_mode, question, current, v3
         0,
     ),  # boilerplate is not the question
     ("5", "492", "numeric", "What is the accuracy score with 5 folds?", 0, 0),  # rescaled integer needs 1 dp
+    ("Uttar Pradesh", "UTTARPRADESH", "exact_short", "Which state?", 0, 1),
+    ("e-commerce", "E commerce", "exact_short", "Which sector?", 0, 1),
+    ("5", "-5", "numeric", "Value?", 0, 0),
+    ("C++", "C", "exact_short", "Which language?", 0, 0),
+    ("Normal/Flying", "Flying", "exact_short", "Which type?", 0, 0),
+    ("Female", "F", "exact_short", "Which gender?", 0, 0),
+    ("TV", "-TV", "exact_short", "Which feature?", 0, 0),
 ]
 
 
