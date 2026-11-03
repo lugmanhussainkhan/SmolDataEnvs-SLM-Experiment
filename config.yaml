@@ -1,0 +1,32 @@
+model:
+  name: hosted_vllm/LiquidAI/LFM2.5-350M
+  args:
+    api_base: http://127.0.0.1:8000/v1
+    temperature: 0.1
+    top_p: 1.0
+    top_k: 50
+    repetition_penalty: 1.05
+    max_tokens: 1024
+
+data:
+  dir: data
+
+agent:
+  max_turns: 12
+  exec_timeout: 90
+  tool_output_chars: 8000
+  system_prompt: null
+
+sandbox:
+  mem_gb: 6
+
+run:
+  concurrency: 32
+  seed: 0
+
+chain:
+  - {
+      name: test,
+      data: { split: test },
+      run: { trials: 4, out: runs/lfm350m-test.json },
+    }
