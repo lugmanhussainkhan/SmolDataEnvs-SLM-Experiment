@@ -234,17 +234,16 @@ async def run_episode(
                 raise
             choice, usage = resp.choices[0], resp.usage
             msg = choice.message
-            calls = [
-                {
-                    "id": tc.id or f"call_{turn}_{i}",
-                    "type": "function",
-                    "function": {"name": tc.function.name or "", "arguments": tc.function.arguments or ""},
-                }
-                for i, tc in enumerate(msg.tool_calls or [])
-            ]
-            messages.append(
-                {"role": "assistant", "content": msg.content or "", **({"tool_calls": calls} if calls else {})}
-            )
+            # replay the response message as-is so reasoning (thinking_blocks / reasoning_content) stays in context
+            assistant = msg.model_dump(exclude_none=True)
+            # empty content: "" keeps chat templates happy, but next to thinking blocks LiteLLM would inject a
+            # placeholder text block for "", so leave it None there
+            assistant["content"] = msg.content or (None if assistant.get("thinking_blocks") else "")
+            calls = assistant.get("tool_calls") or []
+            for tc in calls:
+                tc["function"]["name"] = tc["function"].get("name") or ""
+                tc["function"]["arguments"] = tc["function"].get("arguments") or ""
+            messages.append(assistant)
             turn_rec = {
                 "turn": turn,
                 "finish_reason": choice.finish_reason,
