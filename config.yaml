@@ -18,6 +18,9 @@ agent:
 
 sandbox:
   mem_gb: 6
+  threads: 1
+  remote: []
+  remote_slack: 600
 
 run:
   concurrency: 32

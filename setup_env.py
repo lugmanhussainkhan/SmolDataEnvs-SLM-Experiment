@@ -7,6 +7,9 @@
 
     uv run setup_env.py --config config.yaml [--splits eval,test] [--check-only]
 
+With sandbox.remote set, only the task list is downloaded here and the workers are checked; on each
+worker machine run `uv run setup_env.py --config config.yaml --set sandbox.remote=[]` first.
+
 Layout: <data.dir>/SmolDataEnvs/data/<split>-*.parquet and <data.dir>/task_files/<bucket_prefix>/<file>.
 HF_TOKEN is read from the environment or .env.
 """
@@ -17,7 +20,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import threading
@@ -28,7 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agent_eval as ev  # noqa: E402
-from sandbox import Sandbox, SandboxError  # noqa: E402
+from sandbox import LocalBackend, RemoteBackend, Sandbox, SandboxError, precompile  # noqa: E402
 
 DATASET = "FineEnvs/SmolDataEnvs"
 APPARMOR_FIX = """bwrap is blocked. On Ubuntu 23.10+ give it an AppArmor profile:
@@ -61,7 +63,7 @@ def hf_retry(fn, attempts: int = 12):
             time.sleep(wait)
 
 
-def download(data_dir: Path, splits: list[str], revision: str | None, workers: int) -> None:
+def download(data_dir: Path, splits: list[str], revision: str | None, workers: int, files: bool = True) -> None:
     import pandas as pd
     from huggingface_hub import download_bucket_files, list_bucket_tree, snapshot_download
 
@@ -80,6 +82,9 @@ def download(data_dir: Path, splits: list[str], revision: str | None, workers: i
     ]
     prefixes = sorted({(r["hf_bucket"], r["bucket_prefix"]) for r in rows})
     print(f"tasks     {len(rows)} in {splits}, {len(prefixes)} data folders")
+    if not files:
+        print("files     staged on the sandbox workers, not here")
+        return
 
     cache_path = data_dir / "bucket_listing_cache.json"  # one API call per folder; listings are reused
     cache = json.loads(cache_path.read_text()) if cache_path.is_file() else {}
@@ -143,66 +148,88 @@ def download(data_dir: Path, splits: list[str], revision: str | None, workers: i
             print(f"  {done}/{n}", flush=True)
 
 
-def check(runs: list[dict]) -> bool:
+PROBE = (
+    "ls /home/user/input >/dev/null && echo reads-input; "
+    "python3 -c 'import pandas, numpy, scipy, sklearn' && echo packages-ok; "
+    "f=$(ls /home/user/input | grep -viE '\\.(sqlite3?|db|h5|hdf5)$' | head -1); "
+    '(echo x >> "/home/user/input/$f") 2>/dev/null || echo input-readonly; '
+    "python3 -c \"import socket; socket.create_connection(('1.1.1.1', 53), 3)\" 2>/dev/null "
+    "&& echo NET-OPEN || echo net-blocked; echo -n 7 > /workdir/answer.txt"
+)
+MUTABLE = (".sqlite", ".sqlite3", ".db", ".h5", ".hdf5")
+
+
+def probe(ep, label: str) -> bool:
+    try:
+        res, answer = ep.run(PROBE, 120), ep.answer()
+    finally:
+        ep.close()
     ok = True
+    for want, what in [
+        ("reads-input", "reads task files"),
+        ("packages-ok", "has pandas, numpy, scipy, sklearn"),
+        ("input-readonly", "task files are read-only"),
+        ("net-blocked", "no network"),
+    ]:
+        ok &= want in res.stdout.split()
+        print(f"[{'ok' if want in res.stdout.split() else '!!'}] {label} {what}")
+    ok &= answer == "7"
+    print(f"[{'ok' if answer == '7' else '!!'}] {label} writes /workdir/answer.txt")
+    if not ok and res.stderr.strip():
+        print("    stderr:", res.stderr.strip()[-600:])
+    return ok
+
+
+def check(runs: list[dict]) -> bool:
+    cfg, ok = runs[0], True
+    sc = cfg["sandbox"]
+    try:
+        if sc["remote"]:
+            backend = RemoteBackend(sc["remote"], os.environ.get("SANDBOX_TOKEN", ""), sc["remote_slack"])
+            print(f"[ok] {len(backend.urls)} workers reachable, {sum(backend.slots.values())} slots in total")
+        else:
+            python = sc["python"] or sys.executable
+            precompile(python)
+            backend = LocalBackend(
+                Sandbox(python, sc["mem_gb"], Path(tempfile.mkdtemp(prefix="smol-setup-")), sc["threads"], sc["net"]),
+                cfg["data"]["dir"],
+            )
+    except SandboxError as exc:
+        print(f"[!!] sandbox: {exc}")
+        if any(s in str(exc) for s in ("uid map", "RTM_NEWADDR", "Permission denied")):
+            print(APPARMOR_FIX)
+        return False
+
+    rows = []
     for run in runs:
         try:
             rows = ev.load_tasks(run["data"])
         except SystemExit as exc:
             print(f"[!!] {run['name']}: {exc}")
             return False
-        missing = sum(bool(ev.input_files(r, run["data"]["dir"])[1]) for r in rows)
+        missing = len(backend.check(rows))
+        where = "on a worker" if sc["remote"] else "here"
         print(
             f"[{'ok' if not missing else '!!'}] {run['name']}: {len(rows)} tasks ({run['data']['split']}), "
-            f"{missing} with missing input files"
+            f"{missing} with input files missing {where}"
         )
         ok &= not missing
-
-    cfg = runs[0]
-    python = cfg["sandbox"]["python"] or sys.executable
-    subprocess.run(
-        [
-            python,
-            "-c",
-            "import importlib\nfor m in ('pandas','numpy','scipy.stats','sklearn.linear_model',"
-            "'sklearn.ensemble'):\n try: importlib.import_module(m)\n except Exception: pass",
-        ],
-        capture_output=True,
-        timeout=900,
-    )  # compile bytecode once; the sandbox env is read-only
-    with tempfile.TemporaryDirectory() as tmp:
-        probe = Path(tmp) / "probe.csv"
-        probe.write_text("a\n1\n2\n")
-        try:
-            ep = Sandbox(python, cfg["sandbox"]["mem_gb"], Path(tmp) / "scratch").episode({"probe.csv": probe})
-            res = ep.run(
-                "python3 -c \"import pandas as pd; print(pd.read_csv('/home/user/input/probe.csv').a.sum())\"; "
-                "python3 -c 'import pandas, numpy, scipy, sklearn' && echo packages-ok; "
-                "(echo x > /home/user/input/probe.csv) 2>/dev/null || echo input-readonly; "
-                "python3 -c \"import socket; socket.create_connection(('1.1.1.1', 53), 3)\" 2>/dev/null "
-                "&& echo NET-OPEN || echo net-blocked; echo -n 7 > /workdir/answer.txt",
-                120,
-            )
-            answer = ep.answer()
-            ep.close()
-        except SandboxError as exc:
-            print(f"[!!] sandbox: {exc}")
-            if any(s in str(exc) for s in ("uid map", "RTM_NEWADDR", "Permission denied")):
-                print(APPARMOR_FIX)
-            return False
-    lines = res.stdout.split()
-    for want, label in [
-        ("3", "reads task files"),
-        ("packages-ok", "has pandas, numpy, scipy, sklearn"),
-        ("input-readonly", "task files are read-only"),
-        ("net-blocked", "no network"),
-    ]:
-        ok &= want in lines
-        print(f"[{'ok' if want in lines else '!!'}] sandbox {label}")
-    ok &= answer == "7"
-    print(f"[{'ok' if answer == '7' else '!!'}] sandbox writes /workdir/answer.txt")
-    if not ok and res.stderr.strip():
-        print("    sandbox stderr:", res.stderr.strip()[-600:])
+    row = next((r for r in rows if r["files"] and not all(str(f).lower().endswith(MUTABLE) for f in r["files"])), None)
+    if row is None or not ok:
+        return False
+    try:
+        if sc["remote"]:
+            for url in backend.urls:
+                ok &= probe(backend.episode(row, url), f"worker {url}")
+        else:
+            ok &= probe(backend.episode(row), "sandbox")
+    except SandboxError as exc:
+        print(f"[!!] sandbox: {exc}")
+        if any(s in str(exc) for s in ("uid map", "RTM_NEWADDR", "Permission denied")):
+            print(APPARMOR_FIX)
+        return False
+    finally:
+        backend.close()
     return ok
 
 
@@ -230,7 +257,7 @@ def main() -> None:
         for d, splits in by_dir.items():
             splits = a.splits.split(",") if a.splits else splits
             print(f"data dir {d}: splits {splits}")
-            download(Path(d), splits, a.revision, a.workers)
+            download(Path(d), splits, a.revision, a.workers, files=not runs[0]["sandbox"]["remote"])
     print()
     if not check(runs):
         sys.exit("\nsetup incomplete: fix the [!!] items above")

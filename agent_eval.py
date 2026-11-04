@@ -18,7 +18,8 @@ import copy
 import hashlib
 import json
 import math
-import shutil
+import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -30,7 +31,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from grader import grade as grade_answer  # noqa: E402
-from sandbox import Sandbox, SandboxError  # noqa: E402
+from sandbox import LocalBackend, MissingInputs, RemoteBackend, Sandbox, SandboxError, input_files  # noqa: E402,F401
 
 DEFAULTS = {
     "model": {
@@ -41,7 +42,14 @@ DEFAULTS = {
     },
     "data": {"dir": "data", "split": "test", "tiers": [], "task_ids": None, "limit": 0},
     "agent": {"max_turns": 12, "exec_timeout": 90, "tool_output_chars": 8000, "system_prompt": None},
-    "sandbox": {"python": None, "mem_gb": 16},
+    "sandbox": {
+        "python": None,
+        "mem_gb": 16,
+        "threads": 2,  # BLAS/OpenMP threads per command
+        "net": "bwrap",
+        "remote": [],  # sandbox_server.py URLs; empty = run locally. SANDBOX_TOKEN in env or .env
+        "remote_slack": 600,  # seconds a call may wait in a worker's queue
+    },
     "run": {"trials": 1, "concurrency": 16, "seed": 0, "out": "runs/eval.json", "skip_existing": False},
 }
 
@@ -127,15 +135,6 @@ def load_tasks(data: dict) -> list[dict]:
     return rows[: data["limit"]] if data["limit"] else rows
 
 
-def input_files(row: dict, data_dir: str) -> tuple[dict[str, Path], list[str]]:
-    """({name: path} of the task's files, missing names). An empty `files` list means the whole prefix."""
-    prefix = Path(data_dir) / "task_files" / row["bucket_prefix"]
-    names = row["files"] or (sorted(p.name for p in prefix.iterdir() if p.is_file()) if prefix.is_dir() else [])
-    found = {Path(n).name: prefix / Path(n).name for n in names}
-    missing = [n for n, p in found.items() if not p.is_file()] or ([] if found else ["(no files staged)"])
-    return {n: p for n, p in found.items() if p.is_file()}, missing
-
-
 def grade(row: dict, answer: str | None) -> dict:
     if not (answer or "").strip():
         return {"reward": 0.0, "grade_method": "no_answer_file"}
@@ -163,7 +162,10 @@ def run_tool(ep, name: str, arguments: str, agent: dict) -> tuple[str, dict]:
     res = ep.run(command, agent["exec_timeout"])
     text = res.stdout + res.stderr + (f"\n[killed: exceeded {res.seconds:.0f}s]" if res.timed_out else "")
     text = text[: agent["tool_output_chars"]] if text.strip() else f"(empty output, rc={res.returncode})"
-    return text, {"returncode": res.returncode, "timed_out": res.timed_out, "seconds": res.seconds}
+    ex = {"returncode": res.returncode, "timed_out": res.timed_out, "seconds": res.seconds}
+    if res.worker:
+        ex.update(worker=res.worker, queue_seconds=res.queue_seconds)
+    return text, ex
 
 
 def _is_context_error(exc: Exception) -> bool:
@@ -178,7 +180,7 @@ def _is_context_error(exc: Exception) -> bool:
 
 
 async def run_episode(
-    cfg: dict, row: dict, trial: int, sb: Sandbox, pool: ThreadPoolExecutor, attempt: int = 0
+    cfg: dict, row: dict, trial: int, backend, pool: ThreadPoolExecutor, attempt: int = 0
 ) -> dict:
     import litellm
 
@@ -204,11 +206,6 @@ async def run_episode(
         "turns": [],
         "messages": [],
     }
-    files, missing = input_files(row, cfg["data"]["dir"])
-    if missing:
-        rec["error"] = f"missing input files: {missing}"
-        return rec
-
     args = dict(m["args"])
     if (args.get("temperature") or 0) > 0:
         args.setdefault("seed", cfg["run"]["seed"] * 1000 + trial + 1_000_000 * attempt)
@@ -217,7 +214,11 @@ async def run_episode(
         {"role": "user", "content": row["instruction"]},
     ]
     t0 = time.time()
-    ep = await loop.run_in_executor(pool, sb.episode, files)
+    try:
+        ep = await loop.run_in_executor(pool, backend.episode, row)
+    except SandboxError as exc:  # MissingInputs included
+        rec["error"] = f"sandbox: {exc}"
+        return rec
     rec["stop"] = "max_turns"
     try:
         for turn in range(agent["max_turns"]):
@@ -276,7 +277,7 @@ async def run_episode(
                 messages.append(
                     {"role": "tool", "tool_call_id": tc["id"], "name": tc["function"]["name"], "content": text}
                 )
-        rec["answer"] = ep.answer()
+        rec["answer"] = await loop.run_in_executor(pool, ep.answer)
         rec.update(grade(row, rec["answer"]))
     except SandboxError as exc:
         rec["error"] = f"sandbox: {exc}"
@@ -316,6 +317,23 @@ def score_block(results: list[dict], trials: int) -> dict:
     return out
 
 
+def worker_stats(results: list[dict]) -> dict:
+    calls = defaultdict(list)
+    for r in results:
+        for t in r["turns"]:
+            for ex in t["executions"]:
+                if ex.get("worker"):
+                    calls[ex["worker"]].append(ex)
+    return {
+        w: {
+            "calls": len(v),
+            "mean_seconds": round(sum(x["seconds"] for x in v) / len(v), 3),
+            "mean_queue_seconds": round(sum(x["queue_seconds"] for x in v) / len(v), 3),
+        }
+        for w, v in sorted(calls.items())
+    }
+
+
 def summarize(cfg: dict, results: list[dict], wall: float, resumed: int) -> dict:
     graded = [r for r in results if r["reward"] is not None]
     mean = lambda key: round(sum(r[key] for r in graded) / len(graded), 2) if graded else None  # noqa: E731
@@ -343,12 +361,26 @@ def summarize(cfg: dict, results: list[dict], wall: float, resumed: int) -> dict
         "mean_tool_calls": mean("n_tool_calls"),
         "mean_prompt_tokens": mean("prompt_tokens"),
         "mean_completion_tokens": mean("completion_tokens"),
+        **({"sandbox": workers} if (workers := worker_stats(results)) else {}),
         "resumed_episodes": resumed,
         "wall_seconds": round(wall, 1),
     }
 
 
 # ── run ──────────────────────────────────────────────────────────────────────
+
+
+def make_backend(cfg: dict):
+    sc = cfg["sandbox"]
+    try:
+        if sc["remote"]:
+            return RemoteBackend(sc["remote"], os.environ.get("SANDBOX_TOKEN", ""), sc["remote_slack"])
+        sandbox = Sandbox(
+            sc["python"], sc["mem_gb"], Path(tempfile.mkdtemp(prefix="smol-agent-")), sc["threads"], sc["net"]
+        )
+        return LocalBackend(sandbox, cfg["data"]["dir"])
+    except (SandboxError, subprocess.CalledProcessError) as exc:
+        sys.exit(f"sandbox: {exc}")
 
 
 def _finished(rec: dict, train_mode: bool) -> bool:
@@ -384,12 +416,11 @@ def run_one(cfg: dict, resume: bool = False, train_mode: bool = False) -> dict:
         f"({len(done)} resumed{', train mode' if train_mode else ''}), concurrency {cfg['run']['concurrency']}"
     )
 
-    scratch = Path(tempfile.mkdtemp(prefix="smol-agent-"))
-    try:
-        sb = Sandbox(cfg["sandbox"]["python"], cfg["sandbox"]["mem_gb"], scratch)
-    except Exception as exc:
-        shutil.rmtree(scratch, ignore_errors=True)
-        sys.exit(f"sandbox: {exc}")
+    backend = make_backend(cfg)
+    if missing := backend.check([r for r, _ in todo]):
+        backend.close()
+        where = "the workers (run setup_env.py there)" if cfg["sandbox"]["remote"] else cfg["data"]["dir"]
+        sys.exit(f"{len(missing)} tasks have input files missing on {where}, e.g. {missing[:3]}")
 
     async def run_all() -> list[dict]:
         pool = ThreadPoolExecutor(max(4, cfg["run"]["concurrency"]))
@@ -399,7 +430,7 @@ def run_one(cfg: dict, resume: bool = False, train_mode: bool = False) -> dict:
         async def one(row: dict, trial: int) -> dict:
             nonlocal n
             async with sem:
-                rec = await run_episode(cfg, row, trial, sb, pool, attempts.get((row["task_id"], trial), 0))
+                rec = await run_episode(cfg, row, trial, backend, pool, attempts.get((row["task_id"], trial), 0))
             n += 1
             with partial.open("a") as fh:
                 fh.write(json.dumps(rec) + "\n")
@@ -420,8 +451,12 @@ def run_one(cfg: dict, resume: bool = False, train_mode: bool = False) -> dict:
     t0 = time.time()
     try:
         results = list(done.values()) + asyncio.run(run_all())
+    except KeyboardInterrupt:
+        backend.kill_all()
+        saved = sum(1 for line in partial.read_text().splitlines() if line.strip()) if partial.is_file() else 0
+        sys.exit(f"\ninterrupted: {saved} episodes saved in {partial}; rerun with --resume to continue")
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+        backend.close()
     results.sort(key=lambda r: (r["task_id"], r["trial"]))
     summary = summarize(cfg, results, time.time() - t0, len(done))
     shown = copy.deepcopy(cfg)
