@@ -8,6 +8,7 @@
 uv run agent_eval.py --config config.yaml
 uv run agent_eval.py --config config.yaml --set run.trials=4 --steps test --resume
 uv run agent_eval.py --config config.yaml --resume --train-mode
+uv run agent_eval.py --config config.yaml --set data.continue_from=stuck_states.jsonl --resume --train-mode
 """
 
 from __future__ import annotations
@@ -40,8 +41,8 @@ DEFAULTS = {
         "num_retries": 3,
         "timeout": 600,
     },
-    "data": {"dir": "data", "split": "test", "tiers": [], "task_ids": None, "limit": 0},
-    "agent": {"max_turns": 12, "exec_timeout": 90, "tool_output_chars": 8000, "system_prompt": None},
+    "data": {"dir": "data", "split": "test", "tiers": [], "task_ids": None, "limit": 0, "continue_from": None},
+    "agent": {"max_turns": 12, "exec_timeout": 90, "tool_output_chars": 8000, "system_prompt": None, "replay": True},
     "sandbox": {
         "python": None,
         "mem_gb": 16,
@@ -120,19 +121,45 @@ def load_runs(path: str | None, sets: list[str]) -> list[dict]:
 def load_tasks(data: dict) -> list[dict]:
     import pandas as pd
 
-    paths = sorted((Path(data["dir"]) / "SmolDataEnvs" / "data").glob(f"{data['split']}-*.parquet"))
+    split = "*" if data["continue_from"] else data["split"]
+    paths = sorted((Path(data["dir"]) / "SmolDataEnvs" / "data").glob(f"{split}-*.parquet"))
     if not paths:
-        sys.exit(f"no parquet for split {data['split']!r} under {data['dir']}; run setup_env.py first")
+        sys.exit(f"no parquet for split {split!r} under {data['dir']}; run setup_env.py first")
     rows = pd.concat([pd.read_parquet(p) for p in paths]).to_dict(orient="records")
     for r in rows:
         r["files"] = [str(f) for f in r["files"]]
+        r["id"] = r["task_id"]
+    if data["continue_from"]:
+        rows = load_states(data["continue_from"], rows)
     if data["tiers"]:
         rows = [r for r in rows if r["difficulty_tier"] in set(data["tiers"])]
     if ids := data["task_ids"]:
         ids = json.loads(Path(ids).read_text()) if isinstance(ids, str) else ids
-        by_id = {r["task_id"]: r for r in rows}
-        rows = [by_id[i] for i in ids if i in by_id]
+        by_id = defaultdict(list)
+        for r in rows:
+            by_id[r["task_id"]].append(r)
+        rows = [r for i in ids for r in by_id.get(i, [])]
     return rows[: data["limit"]] if data["limit"] else rows
+
+
+def load_states(path: str, tasks: list[dict]) -> list[dict]:
+    by_id = {r["task_id"]: r for r in tasks}
+    rows, missing = [], []
+    for line in Path(path).read_text().splitlines():
+        if not line.strip():
+            continue
+        st = json.loads(line)
+        if st["task_id"] not in by_id:
+            missing.append(st["task_id"])
+            continue
+        meta = {k: st.get(k) for k in ("trial", "group", "kind", "cut", "keep_calls", "student_answer")}
+        rows.append(
+            {**by_id[st["task_id"]], "id": f"{st['task_id']}/t{st['trial']}", "prefix": st["messages"],
+             "continued_from": meta}
+        )
+    if missing:
+        sys.exit(f"{path}: {len(missing)} states reference unknown task ids, e.g. {missing[:3]}")
+    return rows
 
 
 def grade(row: dict, answer: str | None) -> dict:
@@ -179,6 +206,21 @@ def _is_context_error(exc: Exception) -> bool:
     )
 
 
+def replay_prefix(ep, prefix: list[dict], agent: dict) -> dict:
+    saved = {m["tool_call_id"]: m["content"] for m in prefix if m["role"] == "tool"}
+    t0, calls, mismatched = time.time(), 0, 0
+    for m in prefix:
+        for tc in (m.get("tool_calls") or []) if m["role"] == "assistant" else []:
+            text, _ = run_tool(ep, tc["function"]["name"], tc["function"]["arguments"], agent)
+            calls += 1
+            mismatched += saved.get(tc["id"]) != text
+    return {"calls": calls, "mismatched": mismatched, "seconds": round(time.time() - t0, 2)}
+
+
+def _wire(messages: list[dict]) -> list[dict]:
+    return [{k: v for k, v in m.items() if k != "train"} for m in messages]
+
+
 async def run_episode(
     cfg: dict, row: dict, trial: int, backend, pool: ThreadPoolExecutor, attempt: int = 0
 ) -> dict:
@@ -186,8 +228,10 @@ async def run_episode(
 
     loop = asyncio.get_running_loop()
     m, agent = cfg["model"], cfg["agent"]
+    prefix = row.get("prefix")
     rec = {
         "task_id": row["task_id"],
+        **({"state": row["id"], "continued_from": row["continued_from"]} if prefix else {}),
         "trial": trial,
         "attempt": attempt,
         "tier": row["difficulty_tier"],
@@ -209,10 +253,15 @@ async def run_episode(
     args = dict(m["args"])
     if (args.get("temperature") or 0) > 0:
         args.setdefault("seed", cfg["run"]["seed"] * 1000 + trial + 1_000_000 * attempt)
-    messages = [
-        {"role": "system", "content": agent["system_prompt"] or SYSTEM_PROMPT},
-        {"role": "user", "content": row["instruction"]},
-    ]
+    if prefix:
+        messages = copy.deepcopy(prefix)
+        max_turns = agent["max_turns"] - sum(m["role"] == "assistant" for m in prefix)
+    else:
+        messages = [
+            {"role": "system", "content": agent["system_prompt"] or SYSTEM_PROMPT},
+            {"role": "user", "content": row["instruction"]},
+        ]
+        max_turns = agent["max_turns"]
     t0 = time.time()
     try:
         ep = await loop.run_in_executor(pool, backend.episode, row)
@@ -221,13 +270,15 @@ async def run_episode(
         return rec
     rec["stop"] = "max_turns"
     try:
-        for turn in range(agent["max_turns"]):
+        if prefix and agent["replay"]:
+            rec["replay"] = await loop.run_in_executor(pool, replay_prefix, ep, prefix, agent)
+        for turn in range(max_turns):
             t_call = time.time()
             sent = (len(messages), _digest(messages))
             try:
                 resp = await litellm.acompletion(
                     model=m["name"],
-                    messages=messages,
+                    messages=_wire(messages),
                     tools=[BASH_TOOL],
                     tool_choice="auto",
                     num_retries=m["num_retries"],
@@ -235,7 +286,7 @@ async def run_episode(
                     **args,
                 )
             except Exception as exc:
-                if turn > 0 and _is_context_error(exc):
+                if (turn > 0 or prefix) and _is_context_error(exc):
                     rec["stop"] = "context_full"
                     break
                 raise
@@ -247,6 +298,8 @@ async def run_episode(
             for tc in calls:
                 tc["function"]["name"] = tc["function"].get("name") or ""
                 tc["function"]["arguments"] = tc["function"].get("arguments") or ""
+            if prefix:
+                assistant["train"] = True
             messages.append(assistant)
             turn_rec = {
                 "turn": turn,
@@ -300,7 +353,7 @@ def score_block(results: list[dict], trials: int) -> dict:
     by_task = defaultdict(list)
     for r in results:
         if r["reward"] is not None:
-            by_task[r["task_id"]].append(r["reward"])
+            by_task[r.get("state") or r["task_id"]].append(r["reward"])
     tasks = list(by_task.values())
     out = {"tasks": len(tasks), "pass@1": round(sum(sum(v) / len(v) for v in tasks) / len(tasks), 4) if tasks else None}
     k = 2
@@ -338,8 +391,10 @@ def summarize(cfg: dict, results: list[dict], wall: float, resumed: int) -> dict
     graded = [r for r in results if r["reward"] is not None]
     mean = lambda key: round(sum(r[key] for r in graded) / len(graded), 2) if graded else None  # noqa: E731
     trials = cfg["run"]["trials"]
+    continued = [r for r in results if r.get("continued_from")]
     return {
         "model": cfg["model"]["name"],
+        **({"continue_from": cfg["data"]["continue_from"]} if continued else {}),
         "split": cfg["data"]["split"],
         "episodes": len(results),
         "graded": len(graded),
@@ -352,6 +407,21 @@ def summarize(cfg: dict, results: list[dict], wall: float, resumed: int) -> dict
             m: score_block([r for r in results if r["reward_mode"] == m], trials)
             for m in sorted({r["reward_mode"] for r in results})
         },
+        **(
+            {
+                "by_kind": {
+                    k: score_block([r for r in continued if str(r["continued_from"]["kind"]) == k], trials)
+                    for k in sorted({str(r["continued_from"]["kind"]) for r in continued})
+                },
+                "by_cut": {
+                    c: score_block([r for r in continued if str(r["continued_from"]["cut"]) == c], trials)
+                    for c in sorted({str(r["continued_from"]["cut"]) for r in continued})
+                },
+                "replay_mismatched": sum(bool(r.get("replay", {}).get("mismatched")) for r in continued),
+            }
+            if continued
+            else {}
+        ),
         "stop_reasons": dict(Counter(r["stop"] for r in graded)),
         "grade_methods": dict(Counter(r["grade_method"] for r in graded)),
         "answered": sum(r["grade_method"] != "no_answer_file" for r in graded),
@@ -383,6 +453,10 @@ def make_backend(cfg: dict):
         sys.exit(f"sandbox: {exc}")
 
 
+def _key(rec: dict) -> tuple[str, int]:
+    return rec.get("state") or rec["task_id"], rec["trial"]
+
+
 def _finished(rec: dict, train_mode: bool) -> bool:
     return rec["error"] is None and (not train_mode or (rec["reward"] or 0) > 0)
 
@@ -393,7 +467,7 @@ def run_one(cfg: dict, resume: bool = False, train_mode: bool = False) -> dict:
     out.parent.mkdir(parents=True, exist_ok=True)
     partial = out.with_suffix(out.suffix + ".partial.jsonl")
     trials = cfg["run"]["trials"]
-    wanted = {(r["task_id"], t) for r in rows for t in range(trials)}
+    wanted = {(r["id"], t) for r in rows for t in range(trials)}
     done, previous, attempts = {}, [], {}
     if resume:  # keep finished episodes from the output and the partial log; rerun the rest
         if out.is_file():
@@ -401,18 +475,19 @@ def run_one(cfg: dict, resume: bool = False, train_mode: bool = False) -> dict:
         if partial.is_file():
             previous += [json.loads(line) for line in partial.read_text().splitlines() if line.strip()]
         done = {
-            (r["task_id"], r["trial"]): r
+            _key(r): r
             for r in previous
-            if _finished(r, train_mode) and (r["task_id"], r["trial"]) in wanted
+            if _finished(r, train_mode) and _key(r) in wanted
         }
         for r in previous:
-            key = (r["task_id"], r["trial"])
+            key = _key(r)
             attempts[key] = max(attempts.get(key, 0), r.get("attempt", 0) + 1)
     elif partial.is_file():
         partial.unlink()
-    todo = [(r, t) for r in rows for t in range(trials) if (r["task_id"], t) not in done]
+    todo = [(r, t) for r in rows for t in range(trials) if (r["id"], t) not in done]
     print(
-        f"{cfg['model']['name']} on {cfg['data']['split']}: {len(rows)} tasks x {trials} trials "
+        f"{cfg['model']['name']} on {cfg['data']['continue_from'] or cfg['data']['split']}: "
+        f"{len(rows)} {'states' if cfg['data']['continue_from'] else 'tasks'} x {trials} trials "
         f"({len(done)} resumed{', train mode' if train_mode else ''}), concurrency {cfg['run']['concurrency']}"
     )
 
@@ -430,13 +505,13 @@ def run_one(cfg: dict, resume: bool = False, train_mode: bool = False) -> dict:
         async def one(row: dict, trial: int) -> dict:
             nonlocal n
             async with sem:
-                rec = await run_episode(cfg, row, trial, backend, pool, attempts.get((row["task_id"], trial), 0))
+                rec = await run_episode(cfg, row, trial, backend, pool, attempts.get((row["id"], trial), 0))
             n += 1
             with partial.open("a") as fh:
                 fh.write(json.dumps(rec) + "\n")
             shown = rec["reward"] if rec["error"] is None else "ERR " + rec["error"][:60]
             print(
-                f"[{n:>4}/{len(todo)}] {rec['task_id'][:26]:28} {rec['tier']:6} t{trial} turns={rec['n_turns']:<2} "
+                f"[{n:>4}/{len(todo)}] {row['id'][:30]:32} {rec['tier']:6} t{trial} turns={rec['n_turns']:<2} "
                 f"stop={str(rec['stop']):12} answer={str(rec['answer'])[:20]!r:24} "
                 f"gold={rec['gold'][:16]!r:20} {shown}",
                 flush=True,
@@ -457,7 +532,7 @@ def run_one(cfg: dict, resume: bool = False, train_mode: bool = False) -> dict:
         sys.exit(f"\ninterrupted: {saved} episodes saved in {partial}; rerun with --resume to continue")
     finally:
         backend.close()
-    results.sort(key=lambda r: (r["task_id"], r["trial"]))
+    results.sort(key=_key)
     summary = summarize(cfg, results, time.time() - t0, len(done))
     shown = copy.deepcopy(cfg)
     for k in shown["model"]["args"]:
