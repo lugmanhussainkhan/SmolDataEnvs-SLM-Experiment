@@ -38,6 +38,7 @@ DEFAULTS = {
     "model": {
         "name": None,  # LiteLLM model string, e.g. hosted_vllm/LiquidAI/LFM2.5-350M
         "args": {"temperature": 0.0, "top_p": 1.0, "max_tokens": 1024},
+        "api": "completion",
         "num_retries": 3,
         "timeout": 600,
     },
@@ -108,6 +109,8 @@ def load_runs(path: str | None, sets: list[str]) -> list[dict]:
         cfg["name"] = step.get("name") or (cfg["data"]["split"] if len(steps) > 1 else "run")
         if not cfg["model"]["name"]:
             sys.exit("config: model.name is required")
+        if cfg["model"]["api"] not in ("completion", "responses"):
+            sys.exit(f"config: model.api must be completion or responses, got {cfg['model']['api']!r}")
         runs.append(cfg)
     for field, values in (("name", [c["name"] for c in runs]), ("run.out", [c["run"]["out"] for c in runs])):
         if len(set(values)) != len(values):
@@ -221,11 +224,120 @@ def _wire(messages: list[dict]) -> list[dict]:
     return [{k: v for k, v in m.items() if k != "train"} for m in messages]
 
 
+RESPONSES_TOOL = {"type": "function", **BASH_TOOL["function"]}
+
+
+def _plain(obj) -> dict:
+    return obj.model_dump(mode="json", exclude_none=True) if hasattr(obj, "model_dump") else dict(obj)
+
+
+def _text(content) -> str:
+    if isinstance(content, str):
+        return content
+    return "".join(p.get("text") or "" for p in content or [] if isinstance(p, dict))
+
+
+def _to_responses_input(messages: list[dict]) -> tuple[str | None, list[dict]]:
+    instructions, items = [], []
+    for m in messages:
+        role = m["role"]
+        if role == "system":
+            instructions.append(_text(m["content"]))
+        elif role == "tool":
+            items.append({"type": "function_call_output", "call_id": m["tool_call_id"], "output": _text(m["content"])})
+        elif role == "assistant":
+            if text := _text(m.get("content")):
+                items.append({"role": "assistant", "content": text})
+            for tc in m.get("tool_calls") or []:
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "arguments": tc["function"]["arguments"],
+                    }
+                )
+        else:
+            items.append({"role": role, "content": m["content"]})
+    return ("\n\n".join(instructions) or None), items
+
+
+async def _call_completion(m: dict, messages: list[dict], args: dict) -> tuple[dict, str | None, dict | None]:
+    import litellm
+
+    resp = await litellm.acompletion(
+        model=m["name"],
+        messages=_wire(messages),
+        tools=[BASH_TOOL],
+        tool_choice="auto",
+        num_retries=m["num_retries"],
+        timeout=m["timeout"],
+        **args,
+    )
+    choice, usage = resp.choices[0], resp.usage
+    msg = choice.message
+    assistant = msg.model_dump(exclude_none=True)
+    assistant["content"] = msg.content or (None if assistant.get("thinking_blocks") else "")
+    usage = usage.model_dump(mode="json", exclude_none=True) if usage else None
+    return assistant, choice.finish_reason, usage
+
+
+async def _call_responses(m: dict, messages: list[dict], args: dict) -> tuple[dict, str | None, dict | None]:
+    import litellm
+
+    args = dict(args)
+    args.pop("seed", None)
+    if "max_tokens" in args:
+        args.setdefault("max_output_tokens", args.pop("max_tokens"))
+    if (effort := args.pop("reasoning_effort", None)) is not None:
+        args.setdefault("reasoning", {"effort": effort})
+    instructions, items = _to_responses_input(messages)
+    resp = await litellm.aresponses(
+        model=m["name"],
+        input=items,
+        instructions=instructions,
+        tools=[RESPONSES_TOOL],
+        tool_choice="auto",
+        num_retries=m["num_retries"],
+        timeout=m["timeout"],
+        **args,
+    )
+    text, reasoning, calls = [], [], []
+    for item in map(_plain, resp.output or []):
+        kind = item.get("type")
+        if kind == "reasoning":
+            parts = item.get("content") or item.get("summary") or []
+            reasoning.append("".join(p.get("text") or "" for p in parts))
+        elif kind == "message":
+            text.append("".join(p.get("text") or p.get("refusal") or "" for p in item.get("content") or []))
+        elif kind == "function_call":
+            calls.append(
+                {
+                    "id": item.get("call_id") or item.get("id"),
+                    "type": "function",
+                    "function": {"name": item.get("name") or "", "arguments": item.get("arguments") or ""},
+                }
+            )
+    assistant = {"role": "assistant", "content": "".join(text)}
+    if calls:
+        assistant["tool_calls"] = calls
+    if any(reasoning):
+        assistant["reasoning_content"] = "\n\n".join(r for r in reasoning if r)
+    details = _plain(resp.incomplete_details) if resp.incomplete_details else {}
+    if resp.status == "incomplete":
+        finish = "length" if "max_output_tokens" in str(details.get("reason")) else str(details.get("reason"))
+    else:
+        finish = "tool_calls" if calls else "stop"
+    usage = _plain(resp.usage) if resp.usage else None
+    if usage:
+        usage.setdefault("prompt_tokens", usage.get("input_tokens", 0))
+        usage.setdefault("completion_tokens", usage.get("output_tokens", 0))
+    return assistant, finish, usage
+
+
 async def run_episode(
     cfg: dict, row: dict, trial: int, backend, pool: ThreadPoolExecutor, attempt: int = 0
 ) -> dict:
-    import litellm
-
     loop = asyncio.get_running_loop()
     m, agent = cfg["model"], cfg["agent"]
     prefix = row.get("prefix")
@@ -250,6 +362,7 @@ async def run_episode(
         "turns": [],
         "messages": [],
     }
+    call = _call_responses if m["api"] == "responses" else _call_completion
     args = dict(m["args"])
     if (args.get("temperature") or 0) > 0:
         args.setdefault("seed", cfg["run"]["seed"] * 1000 + trial + 1_000_000 * attempt)
@@ -276,24 +389,13 @@ async def run_episode(
             t_call = time.time()
             sent = (len(messages), _digest(messages))
             try:
-                resp = await litellm.acompletion(
-                    model=m["name"],
-                    messages=_wire(messages),
-                    tools=[BASH_TOOL],
-                    tool_choice="auto",
-                    num_retries=m["num_retries"],
-                    timeout=m["timeout"],
-                    **args,
-                )
+                assistant, finish_reason, usage = await call(m, messages, args)
             except Exception as exc:
                 if (turn > 0 or prefix) and _is_context_error(exc):
                     rec["stop"] = "context_full"
                     break
                 raise
-            choice, usage = resp.choices[0], resp.usage
-            msg = choice.message
-            assistant = msg.model_dump(exclude_none=True)
-            assistant["content"] = msg.content or (None if assistant.get("thinking_blocks") else "")
+            usage = usage or {}
             calls = assistant.get("tool_calls") or []
             for tc in calls:
                 tc["function"]["name"] = tc["function"].get("name") or ""
@@ -303,16 +405,16 @@ async def run_episode(
             messages.append(assistant)
             turn_rec = {
                 "turn": turn,
-                "finish_reason": choice.finish_reason,
-                "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                "finish_reason": finish_reason,
+                "prompt_tokens": usage.get("prompt_tokens") or 0,
+                "completion_tokens": usage.get("completion_tokens") or 0,
                 "latency": round(time.time() - t_call, 3),
                 "context_messages": sent[0],
                 "context_digest": sent[1],
-                "usage": usage.model_dump(mode="json", exclude_none=True) if usage else None,
+                "usage": usage or None,
                 "executions": [],
             }
-            if reasoning := getattr(msg, "reasoning_content", None):
+            if reasoning := assistant.get("reasoning_content"):
                 turn_rec["reasoning"] = reasoning
             rec["prompt_tokens"] += turn_rec["prompt_tokens"]
             rec["completion_tokens"] += turn_rec["completion_tokens"]
