@@ -7,8 +7,8 @@
 
 uv run agent_eval.py --config config.yaml
 uv run agent_eval.py --config config.yaml --set run.trials=4 --steps test --resume
-uv run agent_eval.py --config config.yaml --resume --train-mode
-uv run agent_eval.py --config config.yaml --set data.continue_from=stuck_states.jsonl --resume --train-mode
+uv run agent_eval.py --config config.yaml --set run.trials=3 --train
+uv run agent_eval.py --config config.yaml --set data.continue_from=stuck_states.jsonl --set run.trials=3 --train
 """
 
 from __future__ import annotations
@@ -559,11 +559,22 @@ def _key(rec: dict) -> tuple[str, int]:
     return rec.get("state") or rec["task_id"], rec["trial"]
 
 
-def _finished(rec: dict, train_mode: bool) -> bool:
-    return rec["error"] is None and (not train_mode or (rec["reward"] or 0) > 0)
+def _finished(rec: dict) -> bool:
+    return rec["error"] is None
 
 
-def run_one(cfg: dict, resume: bool = False, train_mode: bool = False) -> dict:
+def _clean(rec: dict) -> bool:
+    return rec["error"] is None and (rec["reward"] or 0) >= 1
+
+
+def _train_pending(results: list[dict], trials: int) -> int:
+    by_task = defaultdict(list)
+    for r in results:
+        by_task[_key(r)[0]].append(r)
+    return sum(not any(map(_clean, v)) and sum(map(_finished, v)) < trials for v in by_task.values())
+
+
+def run_one(cfg: dict, resume: bool = False, train: bool = False) -> dict:
     rows = load_tasks(cfg["data"])
     out = Path(cfg["run"]["out"])
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -579,18 +590,23 @@ def run_one(cfg: dict, resume: bool = False, train_mode: bool = False) -> dict:
         done = {
             _key(r): r
             for r in previous
-            if _finished(r, train_mode) and _key(r) in wanted
+            if _finished(r) and _key(r) in wanted
         }
         for r in previous:
             key = _key(r)
             attempts[key] = max(attempts.get(key, 0), r.get("attempt", 0) + 1)
     elif partial.is_file():
         partial.unlink()
-    todo = [(r, t) for r in rows for t in range(trials) if (r["id"], t) not in done]
+    if train:
+        solved = {k[0] for k, r in done.items() if _clean(r)}
+        todo = [(r, t) for r in rows if r["id"] not in solved for t in range(trials) if (r["id"], t) not in done]
+    else:
+        todo = [(r, t) for r in rows for t in range(trials) if (r["id"], t) not in done]
     print(
         f"{cfg['model']['name']} on {cfg['data']['continue_from'] or cfg['data']['split']}: "
-        f"{len(rows)} {'states' if cfg['data']['continue_from'] else 'tasks'} x {trials} trials "
-        f"({len(done)} resumed{', train mode' if train_mode else ''}), concurrency {cfg['run']['concurrency']}"
+        f"{len(rows)} {'states' if cfg['data']['continue_from'] else 'tasks'} x "
+        f"{f'up to {trials} trials until clean' if train else f'{trials} trials'} "
+        f"({len(done)} resumed), concurrency {cfg['run']['concurrency']}"
     )
 
     backend = make_backend(cfg)
@@ -620,7 +636,23 @@ def run_one(cfg: dict, resume: bool = False, train_mode: bool = False) -> dict:
             )
             return rec
 
+        async def until_clean(row: dict, trials_left: list[int]) -> list[dict]:
+            recs = []
+            for t in trials_left:
+                recs.append(await one(row, t))
+                if _clean(recs[-1]):
+                    break
+            return recs
+
         try:
+            if train:
+                by_row = defaultdict(list)
+                for r, t in todo:
+                    by_row[r["id"]].append((r, t))
+                groups = await asyncio.gather(
+                    *(until_clean(v[0][0], [t for _, t in v]) for v in by_row.values())
+                )
+                return [rec for g in groups for rec in g]
             return await asyncio.gather(*(one(r, t) for r, t in todo))
         finally:
             pool.shutdown(wait=True)
@@ -636,6 +668,17 @@ def run_one(cfg: dict, resume: bool = False, train_mode: bool = False) -> dict:
         backend.close()
     results.sort(key=_key)
     summary = summarize(cfg, results, time.time() - t0, len(done))
+    if train:
+        by_task = defaultdict(list)
+        for r in results:
+            by_task[_key(r)[0]].append(r)
+        firsts = [min((r["trial"] for r in v if _clean(r)), default=None) for v in by_task.values()]
+        summary["train"] = {
+            "tasks": len(by_task),
+            "clean": sum(f is not None for f in firsts),
+            "clean_first_try": sum(f == 0 for f in firsts),
+            "episodes": len(results),
+        }
     shown = copy.deepcopy(cfg)
     for k in shown["model"]["args"]:
         if "key" in k.lower() or ("token" in k.lower() and k != "max_tokens"):
@@ -654,9 +697,9 @@ def main() -> None:
     ap.add_argument("--steps", help="comma list of chain step names to run")
     ap.add_argument("--resume", action="store_true", help="skip finished steps, continue partial ones")
     ap.add_argument(
-        "--train-mode",
+        "--train",
         action="store_true",
-        help="trajectory generation: with --resume, also retry episodes that graded zero (not just errored ones)",
+        help="trajectory generation: run.trials is a per-task budget; stop retrying a task once it scores 1",
     )
     a = ap.parse_args()
     try:
@@ -684,13 +727,14 @@ def main() -> None:
         if resume and out.is_file():
             prev = json.loads(out.read_text())
             summary = prev.get("summary") or {}
-            retry = sum(not _finished(r, a.train_mode) for r in prev.get("results", []))
+            results = prev.get("results", [])
+            retry = _train_pending(results, cfg["run"]["trials"]) if a.train else sum(not _finished(r) for r in results)
             if not retry:
                 print("    output exists, skipping")
                 summaries.append((cfg["name"], summary))
                 continue
-            print(f"    output has {retry} {'failed' if a.train_mode else 'ungraded'} episodes, rerunning those")
-        summaries.append((cfg["name"], run_one(cfg, resume, a.train_mode)))
+            print(f"    output has {retry} {'unsolved tasks with budget left' if a.train else 'ungraded episodes'}, rerunning those")
+        summaries.append((cfg["name"], run_one(cfg, resume, a.train)))
 
     if len(summaries) > 1:
         print("\n=== chain summary")
